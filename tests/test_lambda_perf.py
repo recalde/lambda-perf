@@ -234,5 +234,220 @@ class WrapHandlerTests(unittest.TestCase):
         self.assertIsNone(records[0]["function_name"])
 
 
+class CustomAttributeTests(unittest.TestCase):
+
+    def setUp(self):
+        lambda_perf._COLD_START = True
+
+    def _invoke(self, handler, event=None):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            try:
+                result = handler(event or {}, _context())
+                error = None
+            except BaseException as exc:
+                result = None
+                error = exc
+        records = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        return result, error, records
+
+    def test_attributes_are_recorded(self):
+        @lambda_perf.wrap_handler("m")
+        def handler(event, context):
+            lambda_perf.perf_log.add_attribute("input_size_bytes", 10240)
+            lambda_perf.perf_log.add_attributes(
+                {"transaction_requested": "quote"}, rows=42,
+            )
+            return "ok"
+
+        _, _, records = self._invoke(handler)
+
+        self.assertEqual(records[0]["attributes"], {
+            "input_size_bytes": 10240,
+            "transaction_requested": "quote",
+            "rows": 42,
+        })
+
+    def test_attributes_reset_between_invocations(self):
+        calls = []
+
+        @lambda_perf.wrap_handler("m")
+        def handler(event, context):
+            if not calls:
+                lambda_perf.perf_log.add_attribute("first_only", True)
+            calls.append(1)
+
+        _, _, first = self._invoke(handler)
+        _, _, second = self._invoke(handler)
+
+        self.assertEqual(first[0]["attributes"], {"first_only": True})
+        self.assertEqual(second[0]["attributes"], {})
+
+    def test_attributes_recorded_on_error(self):
+        @lambda_perf.wrap_handler("m")
+        def handler(event, context):
+            lambda_perf.perf_log.add_attribute("step", "parse")
+            raise ValueError("bad")
+
+        _, error, records = self._invoke(handler)
+
+        self.assertIsInstance(error, ValueError)
+        self.assertEqual(records[0]["attributes"], {"step": "parse"})
+
+    def test_add_attribute_outside_invocation_is_ignored(self):
+        lambda_perf.perf_log.add_attribute("orphan", 1)
+
+        self.assertEqual(lambda_perf.perf_log.attributes, {})
+
+    def test_attributes_from_worker_thread(self):
+        import threading
+
+        @lambda_perf.wrap_handler("m")
+        def handler(event, context):
+            t = threading.Thread(
+                target=lambda_perf.perf_log.add_attribute, args=("worker", True),
+            )
+            t.start()
+            t.join()
+
+        _, _, records = self._invoke(handler)
+
+        self.assertEqual(records[0]["attributes"], {"worker": True})
+
+
+class IncludeInResponseTests(unittest.TestCase):
+
+    def setUp(self):
+        lambda_perf._COLD_START = True
+
+    def _invoke(self, handler):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return handler({}, _context())
+
+    def test_disabled_by_default(self):
+        @lambda_perf.wrap_handler("m")
+        def handler(event, context):
+            return {"statusCode": 200}
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(self._invoke(handler), {"statusCode": 200})
+
+    def test_dict_response_gets_perf_key(self):
+        @lambda_perf.wrap_handler("m", include_in_response=True)
+        def handler(event, context):
+            lambda_perf.perf_log.add_attribute("rows", 3)
+            return {"statusCode": 200}
+
+        result = self._invoke(handler)
+
+        self.assertEqual(result["statusCode"], 200)
+        self.assertEqual(result["lambda_perf"]["metric"], "m")
+        self.assertEqual(result["lambda_perf"]["status"], "success")
+        self.assertEqual(result["lambda_perf"]["attributes"], {"rows": 3})
+        self.assertIn("duration_ms", result["lambda_perf"])
+
+    def test_non_dict_response_is_wrapped(self):
+        @lambda_perf.wrap_handler("m", include_in_response=True)
+        def handler(event, context):
+            return [1, 2, 3]
+
+        result = self._invoke(handler)
+
+        self.assertEqual(result["result"], [1, 2, 3])
+        self.assertIn("lambda_perf", result)
+
+    def test_enabled_by_env_var(self):
+        @lambda_perf.wrap_handler("m")
+        def handler(event, context):
+            return {}
+
+        with mock.patch.dict(os.environ, {"LAMBDA_PERF_INCLUDE_IN_RESPONSE": "true"}):
+            self.assertIn("lambda_perf", self._invoke(handler))
+
+        with mock.patch.dict(os.environ, {"LAMBDA_PERF_INCLUDE_IN_RESPONSE": "false"}):
+            self.assertNotIn("lambda_perf", self._invoke(handler))
+
+    def test_explicit_false_overrides_env_var(self):
+        @lambda_perf.wrap_handler("m", include_in_response=False)
+        def handler(event, context):
+            return {}
+
+        with mock.patch.dict(os.environ, {"LAMBDA_PERF_INCLUDE_IN_RESPONSE": "true"}):
+            self.assertEqual(self._invoke(handler), {})
+
+    def test_custom_response_key(self):
+        @lambda_perf.wrap_handler("m", include_in_response=True, response_key="perf")
+        def handler(event, context):
+            return {}
+
+        self.assertIn("perf", self._invoke(handler))
+
+    def test_response_is_json_serializable(self):
+        from datetime import datetime
+        from decimal import Decimal
+
+        @lambda_perf.wrap_handler("m", include_in_response=True)
+        def handler(event, context):
+            lambda_perf.perf_log.add_attribute("amount", Decimal("1.50"))
+            lambda_perf.perf_log.add_attribute("at", datetime(2026, 1, 1))
+            return {}
+
+        result = self._invoke(handler)
+
+        json.dumps(result)
+        self.assertEqual(result["lambda_perf"]["attributes"]["amount"], "1.50")
+
+    def test_original_response_not_mutated(self):
+        original = {"statusCode": 200}
+
+        @lambda_perf.wrap_handler("m", include_in_response=True)
+        def handler(event, context):
+            return original
+
+        self._invoke(handler)
+
+        self.assertEqual(original, {"statusCode": 200})
+
+
+class EnvFlagTests(unittest.TestCase):
+
+    def test_values(self):
+        for value, expected in [
+            ("true", True), ("TRUE", True), ("1", True), ("yes", True),
+            ("on", True), ("false", False), ("0", False), ("", False),
+        ]:
+            with mock.patch.dict(os.environ, {"X_FLAG": value}):
+                self.assertIs(lambda_perf.env_flag("X_FLAG"), expected, value)
+
+    def test_default(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(lambda_perf.env_flag("X_FLAG"))
+            self.assertTrue(lambda_perf.env_flag("X_FLAG", default=True))
+
+
+class ExampleHandlerTests(unittest.TestCase):
+
+    def test_example_handler(self):
+        import importlib
+
+        with mock.patch.dict(os.environ, {
+            "PERF_MEASURE_INPUT": "true",
+            "LAMBDA_PERF_INCLUDE_IN_RESPONSE": "true",
+        }):
+            import lambda_function
+            importlib.reload(lambda_function)
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = lambda_function.lambda_handler(
+                    {"transaction": "quote"}, _context(),
+                )
+
+        self.assertEqual(result["statusCode"], 200)
+        self.assertEqual(
+            result["lambda_perf"]["attributes"]["transaction_requested"], "quote",
+        )
+        self.assertIn("input_size_bytes", result["lambda_perf"]["attributes"])
+
+
 if __name__ == "__main__":
     unittest.main()

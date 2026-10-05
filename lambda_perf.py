@@ -16,6 +16,10 @@ Captures:
 - initialization type (on-demand, provisioned concurrency, SnapStart)
 - invocation metadata
 - success/error status
+- custom per-invocation attributes added by the handler
+
+The record can optionally be added to the handler's response, e.g. for
+Lambdas invoked from Step Functions.
 
 No external dependencies.
 """
@@ -28,7 +32,7 @@ import logging
 import os
 import platform
 import time
-from typing import Any, Callable, TypeVar, overload
+from typing import Any, Callable, Mapping, TypeVar, overload
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -239,6 +243,60 @@ CPU_INFO = _safe_cpu_info()
 
 _COLD_START = True
 
+INCLUDE_IN_RESPONSE_ENV = "LAMBDA_PERF_INCLUDE_IN_RESPONSE"
+DEFAULT_RESPONSE_KEY = "lambda_perf"
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    """
+    Read a boolean environment variable ("1", "true", "yes", "on").
+    """
+
+    value = os.environ.get(name)
+
+    if value is None:
+        return default
+
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+# ---------------------------------------------------------------------------
+# Custom attributes
+# ---------------------------------------------------------------------------
+
+# A plain global rather than a ContextVar so attributes added from worker
+# threads are captured. A Python Lambda process handles one invocation at a time.
+_current_attributes: dict[str, Any] | None = None
+
+
+class PerfLog:
+    """
+    Adds custom attributes to the performance record of the current invocation.
+
+    Attributes are emitted under the record's "attributes" key and reset at
+    the start of every invocation. Calls made outside a wrapped handler are
+    ignored.
+    """
+
+    def add_attribute(self, name: str, value: Any) -> None:
+        if _current_attributes is not None:
+            _current_attributes[name] = value
+
+    def add_attributes(
+        self,
+        attributes: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        for name, value in {**(attributes or {}), **kwargs}.items():
+            self.add_attribute(name, value)
+
+    @property
+    def attributes(self) -> dict[str, Any]:
+        return dict(_current_attributes or {})
+
+
+perf_log = PerfLog()
+
 
 # ---------------------------------------------------------------------------
 # Lambda instrumentation
@@ -274,15 +332,81 @@ def _emit(record: dict[str, Any]) -> None:
     )
 
 
+def _record_invocation(
+    metric_name: str,
+    start_ns: int,
+    cold_start: bool,
+    context: Any,
+    attributes: dict[str, Any],
+    status: str,
+    error_type: str | None,
+) -> dict[str, Any] | None:
+    # A failure here must not replace the handler's return value
+    # or mask its exception.
+    duration_ms = (time.perf_counter_ns() - start_ns) / 1_000_000
+
+    try:
+        record = {
+            "record_type": "lambda_performance",
+            "metric": metric_name,
+            "duration_ms": round(duration_ms, 3),
+            "status": status,
+            "error_type": error_type,
+            "cold_start": cold_start,
+
+            **_lambda_environment(context),
+
+            # CPU dimensions
+            **CPU_INFO,
+
+            "attributes": attributes,
+        }
+    except Exception:
+        _logger.warning("lambda_perf: failed to build record", exc_info=True)
+        return None
+
+    try:
+        _emit(record)
+    except Exception:
+        _logger.warning("lambda_perf: failed to emit record", exc_info=True)
+
+    return record
+
+
+def _add_to_response(result: Any, record: dict[str, Any], key: str) -> Any:
+    try:
+        # Round-trip so custom attribute values the Lambda runtime
+        # can't serialize (Decimal, datetime, ...) don't fail the response.
+        payload = json.loads(json.dumps(record, default=str))
+    except Exception:
+        _logger.warning("lambda_perf: failed to serialize record", exc_info=True)
+        return result
+
+    if isinstance(result, dict):
+        return {**result, key: payload}
+
+    return {"result": result, key: payload}
+
+
 @overload
 def wrap_handler(metric_name: F) -> F: ...
 
 
 @overload
-def wrap_handler(metric_name: str = ...) -> Callable[[F], F]: ...
+def wrap_handler(
+    metric_name: str = ...,
+    *,
+    include_in_response: bool | None = ...,
+    response_key: str = ...,
+) -> Callable[[F], F]: ...
 
 
-def wrap_handler(metric_name: Any = "lambda_invocation") -> Any:
+def wrap_handler(
+    metric_name: Any = "lambda_invocation",
+    *,
+    include_in_response: bool | None = None,
+    response_key: str = DEFAULT_RESPONSE_KEY,
+) -> Any:
     """
     Decorator for AWS Lambda handlers.
 
@@ -295,6 +419,13 @@ def wrap_handler(metric_name: Any = "lambda_invocation") -> Any:
         @wrap_handler
         def lambda_handler(event, context):
             ...
+
+    include_in_response:
+        Add the performance record to successful responses under
+        `response_key`. Dict responses get the key added; any other
+        response is wrapped as {"result": <response>, response_key: ...}.
+        When None, the LAMBDA_PERF_INCLUDE_IN_RESPONSE environment
+        variable is checked on each invocation.
     """
 
     if callable(metric_name):
@@ -305,49 +436,47 @@ def wrap_handler(metric_name: Any = "lambda_invocation") -> Any:
         @functools.wraps(handler)
         def wrapped(event: Any, context: Any) -> Any:
 
-            global _COLD_START
+            global _COLD_START, _current_attributes
 
             cold_start = _COLD_START
             _COLD_START = False
 
+            attributes: dict[str, Any] = {}
+            previous_attributes = _current_attributes
+            _current_attributes = attributes
+
             start_ns = time.perf_counter_ns()
 
-            status = "success"
-            error_type = None
-
             try:
-                return handler(event, context)
+                result = handler(event, context)
 
             except BaseException as exc:
-                status = "error"
-                error_type = type(exc).__name__
+                _record_invocation(
+                    metric_name, start_ns, cold_start, context,
+                    attributes, "error", type(exc).__name__,
+                )
 
                 # Preserve normal Lambda exception behavior.
                 raise
 
             finally:
-                duration_ms = (time.perf_counter_ns() - start_ns) / 1_000_000
+                _current_attributes = previous_attributes
 
-                # A failure here must not replace the handler's
-                # return value or mask its exception.
-                try:
-                    _emit({
-                        "record_type": "lambda_performance",
-                        "metric": metric_name,
-                        "duration_ms": round(duration_ms, 3),
-                        "status": status,
-                        "error_type": error_type,
-                        "cold_start": cold_start,
+            record = _record_invocation(
+                metric_name, start_ns, cold_start, context,
+                attributes, "success", None,
+            )
 
-                        **_lambda_environment(context),
+            include = (
+                env_flag(INCLUDE_IN_RESPONSE_ENV)
+                if include_in_response is None
+                else include_in_response
+            )
 
-                        # CPU dimensions
-                        **CPU_INFO,
-                    })
-                except Exception:
-                    _logger.warning(
-                        "lambda_perf: failed to emit record", exc_info=True
-                    )
+            if include and record is not None:
+                return _add_to_response(result, record, response_key)
+
+            return result
 
         return wrapped  # type: ignore[return-value]
 

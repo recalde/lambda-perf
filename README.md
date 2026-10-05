@@ -42,7 +42,8 @@ Reusable instrumentation module that:
 - Records the vCPU count available to the function
 - Detects cold starts and the initialization type (on-demand, provisioned concurrency, SnapStart)
 - Records runtime, region, function version, and request ID
-- Preserves normal handler return values
+- Lets the handler add custom per-invocation attributes (input size, transaction type, ...)
+- Preserves normal handler return values, or optionally adds the performance record to the response (e.g. for Step Functions)
 - Preserves normal exception behavior
 - Never lets an instrumentation failure break the handler
 - Emits structured JSON to stdout / CloudWatch Logs
@@ -77,7 +78,7 @@ def lambda_handler(event, context):
     return result
 ```
 
-The decorator wraps the existing Lambda invocation without changing the handler's return value.
+The decorator wraps the existing Lambda invocation without changing the handler's return value (unless [including metrics in the response](#including-metrics-in-the-response-step-functions) is enabled).
 
 If the handler raises an exception, the exception is re-raised normally after the performance information is recorded.
 
@@ -115,6 +116,106 @@ def lambda_handler(event, context):
 
 ---
 
+# Custom Attributes
+
+The handler can attach its own attributes to the current invocation's record with `perf_log`. This is useful for recording input complexity so duration can be analyzed relative to workload size:
+
+```python
+import json
+
+from lambda_perf import env_flag, perf_log, wrap_handler
+
+MEASURE_INPUT = env_flag("PERF_MEASURE_INPUT")
+
+
+@wrap_handler("my_lambda")
+def lambda_handler(event, context):
+
+    if MEASURE_INPUT:
+        perf_log.add_attribute("input_size_bytes", len(json.dumps(event)))
+        perf_log.add_attribute("transaction_requested", event.get("transaction"))
+
+    return do_work(event)
+```
+
+Several attributes can be added at once:
+
+```python
+perf_log.add_attributes({"rows": 1200}, transaction_requested="quote")
+```
+
+Attributes appear under the record's `attributes` key:
+
+```json
+{
+  "record_type": "lambda_performance",
+  "duration_ms": 183.427,
+  "attributes": {
+    "input_size_bytes": 10240,
+    "transaction_requested": "quote"
+  }
+}
+```
+
+Attributes are reset at the start of every invocation, are recorded for failed invocations too, and can be added from any thread during the invocation. Calls made outside a wrapped handler (e.g. at import time) are ignored. Prefer `snake_case` names so they are easy to query; CloudWatch Logs Insights exposes them as `attributes.input_size_bytes`.
+
+`env_flag(name)` treats `1`, `true`, `yes`, and `on` (case-insensitive) as enabled.
+
+---
+
+# Including Metrics in the Response (Step Functions)
+
+When a Lambda is invoked from a Step Function, it is often easier to carry the performance record in the task output than to collect it from CloudWatch Logs.
+
+Enable it per function with an environment variable:
+
+```text
+LAMBDA_PERF_INCLUDE_IN_RESPONSE=true
+```
+
+or explicitly in code:
+
+```python
+@wrap_handler("my_lambda", include_in_response=True)
+def lambda_handler(event, context):
+    ...
+```
+
+The decorator adds the record to the response, because the duration is only known after the handler returns. A dict response gets an extra key:
+
+```json
+{
+  "statusCode": 200,
+  "body": "OK",
+  "lambda_perf": {
+    "record_type": "lambda_performance",
+    "metric": "my_lambda",
+    "duration_ms": 183.427,
+    "attributes": { "transaction_requested": "quote" }
+  }
+}
+```
+
+Any other response (list, string, number, `None`) is wrapped:
+
+```json
+{
+  "result": [1, 2, 3],
+  "lambda_perf": { }
+}
+```
+
+Notes:
+
+- Pass `include_in_response=False` to turn it off regardless of the environment variable.
+- Use `response_key="..."` to change the key name from `lambda_perf`.
+- The record is still written to CloudWatch Logs as well.
+- Failed invocations have no response, so their records only appear in the logs.
+- Attribute values that aren't JSON-serializable (`Decimal`, `datetime`, ...) are converted to strings in the response.
+- With the optimized `arn:aws:states:::lambda:invoke` integration, the record is at `$.Payload.lambda_perf` in the task result. Step Functions limits state payloads to 256 KB; the record adds roughly 1 KB plus your attributes.
+
+---
+
 # Example Performance Record
 
 Each invocation emits a single-line JSON record similar to:
@@ -144,7 +245,8 @@ Each invocation emits a single-line JSON record similar to:
   "observed_mhz": null,
   "arm_implementer": "0x41",
   "arm_cpu_part": "0xd0c",
-  "arm_midr": "0x..."
+  "arm_midr": "0x...",
+  "attributes": {}
 }
 ```
 
@@ -164,6 +266,7 @@ Because the output is JSON, it can be queried directly with CloudWatch Logs Insi
 | `status` | `success` or `error` |
 | `error_type` | Python exception type when an invocation fails |
 | `cold_start` | Whether this was the first invocation in the Lambda execution environment |
+| `attributes` | Custom attributes added by the handler via `perf_log` |
 
 ---
 
@@ -546,8 +649,6 @@ Potential extensions include:
 - CPU-time measurement
 - Process memory metrics
 - Peak RSS
-- Input/output byte counts
-- Application-specific throughput counters
 - X-Ray trace IDs
 - AWS Powertools integration
 - Sampling support for very high-volume Lambdas
